@@ -23,7 +23,7 @@ STEGO_LSB_DIR = ROOT / "stego_images" / "lsb"
 STEGO_DCT_DIR = ROOT / "stego_images" / "dct"
 RESULTS_DIR = ROOT / "results"
 IMAGE_EXTS = {".png", ".bmp", ".tif", ".tiff", ".jpg", ".jpeg"}
-EMBED_RATE = 0.9
+EMBED_RATES = (0.1, 0.25, 0.5, 0.75, 1.0)
 N_SYNTHETIC_FALLBACK = 6
 SEED = 2024
 
@@ -55,18 +55,28 @@ def _random_payload(n_bytes: int, rng: np.random.Generator) -> bytes:
 
 def _build_samples(covers: list[tuple[str, np.ndarray]], rng: np.random.Generator):
     samples = []
+    methods = (
+        ("lsb", lsb.capacity_bits, lsb.embed_bytes, STEGO_LSB_DIR),
+        ("dct", dct.capacity_bits, dct.embed_bytes, STEGO_DCT_DIR),
+    )
     for name, cover in covers:
-        samples.append({"image_id": name, "label": 0, "method": "cover", "image": cover})
-
-        lsb_bytes = int(lsb.capacity_bits(cover) * EMBED_RATE) // 8
-        lsb_stego = lsb.embed_bytes(_random_payload(lsb_bytes, rng), cover)
-        utils.save_image(lsb_stego, STEGO_LSB_DIR / f"{name}_p2.png")
-        samples.append({"image_id": name, "label": 1, "method": "lsb", "image": lsb_stego})
-
-        dct_bytes = int(dct.capacity_bits(cover) * EMBED_RATE) // 8
-        dct_stego = dct.embed_bytes(_random_payload(dct_bytes, rng), cover)
-        utils.save_image(dct_stego, STEGO_DCT_DIR / f"{name}_p2.png")
-        samples.append({"image_id": name, "label": 1, "method": "dct", "image": dct_stego})
+        samples.append(
+            {"image_id": name, "label": 0, "method": "cover", "rate": 0.0, "image": cover}
+        )
+        for method, cap_fn, embed_fn, stego_dir in methods:
+            for rate in EMBED_RATES:
+                n_bytes = int(cap_fn(cover) * rate) // 8
+                stego = embed_fn(_random_payload(n_bytes, rng), cover)
+                utils.save_image(stego, stego_dir / f"{name}_r{int(rate * 100):03d}.png")
+                samples.append(
+                    {
+                        "image_id": name,
+                        "label": 1,
+                        "method": method,
+                        "rate": rate,
+                        "image": stego,
+                    }
+                )
     return samples
 
 
@@ -79,6 +89,7 @@ def _score_samples(samples) -> pd.DataFrame:
             {
                 "image_id": s["image_id"],
                 "method": s["method"],
+                "rate": s["rate"],
                 "label": s["label"],
                 "chi_score": chi["embedding_probability"],
                 "chi_pred": int(chi["is_stego"]),
@@ -113,35 +124,36 @@ def _binary_metrics(labels: np.ndarray, preds: np.ndarray) -> dict[str, float]:
     }
 
 
+DETECTORS = (
+    ("chi_square", "chi_score", "chi_pred"),
+    ("histogram", "hist_score", "hist_pred"),
+)
+
+
 def _summarize(scores: pd.DataFrame) -> pd.DataFrame:
     rows = []
     covers = scores[scores["label"] == 0]
-    for detector, score_col, pred_col in (
-        ("chi_square", "chi_score", "chi_pred"),
-        ("histogram", "hist_score", "hist_pred"),
-    ):
+    for detector, score_col, pred_col in DETECTORS:
         labels = scores["label"].to_numpy()
-        preds = scores[pred_col].to_numpy()
-        overall = _binary_metrics(labels, preds)
         _, _, auc = _roc(labels, scores[score_col].to_numpy())
-
-        tpr_by_method = {}
+        cover_fpr = float(np.mean(covers[pred_col] == 1)) if len(covers) else float("nan")
         for method in ("lsb", "dct"):
-            subset = scores[scores["method"] == method]
-            tpr_by_method[method] = float(np.mean(subset[pred_col] == 1)) if len(subset) else float("nan")
-
-        rows.append(
-            {
-                "detector": detector,
-                "accuracy": overall["accuracy"],
-                "tpr": overall["tpr"],
-                "fpr": overall["fpr"],
-                "auc": auc,
-                "tpr_lsb": tpr_by_method["lsb"],
-                "tpr_dct": tpr_by_method["dct"],
-                "n_covers": int(len(covers)),
-            }
-        )
+            for rate in EMBED_RATES:
+                subset = scores[(scores["method"] == method) & np.isclose(scores["rate"], rate)]
+                tpr = float(np.mean(subset[pred_col] == 1)) if len(subset) else float("nan")
+                mean_score = float(subset[score_col].mean()) if len(subset) else float("nan")
+                rows.append(
+                    {
+                        "detector": detector,
+                        "method": method,
+                        "embed_rate": rate,
+                        "tpr": tpr,
+                        "mean_score": mean_score,
+                        "cover_fpr": cover_fpr,
+                        "auc_all_stego": auc,
+                        "n_covers": int(len(covers)),
+                    }
+                )
     return pd.DataFrame(rows)
 
 
@@ -162,19 +174,22 @@ def _plot_roc(scores: pd.DataFrame, out_path: Path) -> None:
     plt.close()
 
 
-def _plot_detection_rate(summary: pd.DataFrame, out_path: Path) -> None:
-    detectors = summary["detector"].tolist()
-    x = np.arange(len(detectors))
-    width = 0.35
+def _plot_vs_rate(summary: pd.DataFrame, column: str, ylabel: str, title: str, out_path: Path) -> None:
     plt.figure(figsize=(7, 5))
-    plt.bar(x - width / 2, summary["tpr_lsb"], width, label="LSB stego")
-    plt.bar(x + width / 2, summary["tpr_dct"], width, label="DCT stego")
-    plt.xticks(x, detectors)
-    plt.ylim(0, 1.05)
-    plt.ylabel("Detection rate (TPR)")
-    plt.title("Detection rate by detector and stego method")
+    for (detector, method), group in summary.groupby(["detector", "method"]):
+        group = group.sort_values("embed_rate")
+        plt.plot(
+            group["embed_rate"],
+            group[column],
+            marker="o",
+            label=f"{detector} / {method.upper()}",
+        )
+    plt.xlabel("Embedding rate (fraction of capacity)")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.ylim(-0.02, 1.05)
     plt.legend()
-    plt.grid(True, axis="y", alpha=0.3)
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close()
@@ -193,18 +208,22 @@ def main() -> None:
     scores_csv = RESULTS_DIR / "paper2_detection_scores.csv"
     summary_csv = RESULTS_DIR / "paper2_detection_summary.csv"
     roc_png = RESULTS_DIR / "paper2_roc.png"
-    rate_png = RESULTS_DIR / "paper2_detection_rate.png"
+    tpr_png = RESULTS_DIR / "paper2_tpr_vs_rate.png"
+    score_png = RESULTS_DIR / "paper2_score_vs_rate.png"
     scores.to_csv(scores_csv, index=False)
     summary.to_csv(summary_csv, index=False)
     _plot_roc(scores, roc_png)
-    _plot_detection_rate(summary, rate_png)
+    _plot_vs_rate(summary, "tpr", "Detection rate (TPR)", "Detection rate vs embedding rate", tpr_png)
+    _plot_vs_rate(summary, "mean_score", "Mean detector score", "Detector response vs embedding rate", score_png)
 
+    n_stego_per_cover = 2 * len(EMBED_RATES)
     print(f"Cover source      : {'real images' if real else 'SYNTHETIC fallback (not paper-valid)'}")
-    print(f"Images scored     : {len(scores)} ({len(covers)} covers x 3)")
+    print(f"Images scored     : {len(scores)} ({len(covers)} covers x (1 + {n_stego_per_cover} stego))")
     print(f"Scores CSV        : {scores_csv.relative_to(ROOT)}")
     print(f"Summary CSV       : {summary_csv.relative_to(ROOT)}")
     print(f"ROC figure        : {roc_png.relative_to(ROOT)}")
-    print(f"Detection-rate fig: {rate_png.relative_to(ROOT)}")
+    print(f"TPR-vs-rate figure: {tpr_png.relative_to(ROOT)}")
+    print(f"Score-vs-rate fig : {score_png.relative_to(ROOT)}")
     print()
     print(summary.to_string(index=False))
 
