@@ -33,13 +33,15 @@ def chi_square_attack(image: np.ndarray, n_regions: int = 8) -> dict[str, object
     gray = to_grayscale(image).ravel()
     overall_p, statistic, df = _chi_square_p(gray)
     region_ps = [_chi_square_p(region)[0] for region in np.array_split(gray, n_regions)]
+    mean_region_p = float(np.mean(region_ps))
     return {
         "overall_p": overall_p,
         "statistic": statistic,
         "df": df,
         "region_probabilities": region_ps,
-        "mean_region_p": float(np.mean(region_ps)),
-        "is_stego": overall_p > CHI_SQUARE_THRESHOLD,
+        "mean_region_p": mean_region_p,
+        "embedding_probability": mean_region_p,
+        "is_stego": mean_region_p > CHI_SQUARE_THRESHOLD,
     }
 
 
