@@ -47,18 +47,17 @@ def capacity_bits(image: np.ndarray) -> int:
     return int(_block_count(image) - HEADER_BITS)
 
 
-def embed(message: str, image: np.ndarray, quant_step: int = QUANT_STEP) -> np.ndarray:
+def embed_bytes(data: bytes, image: np.ndarray, quant_step: int = QUANT_STEP) -> np.ndarray:
     gray = to_grayscale(image).astype(np.float64)
     h, w = gray.shape
     n_blocks_y, n_blocks_x = h // BLOCK, w // BLOCK
 
-    payload = message.encode("utf-8")
-    bits = np.concatenate([_int_to_bits(len(payload), HEADER_BITS), _bytes_to_bits(payload)])
+    bits = np.concatenate([_int_to_bits(len(data), HEADER_BITS), _bytes_to_bits(data)])
 
     total_blocks = n_blocks_y * n_blocks_x
     if bits.size > total_blocks:
         raise ValueError(
-            f"Message too large: needs {bits.size} blocks but image holds {total_blocks}"
+            f"Payload too large: needs {bits.size} blocks but image holds {total_blocks}"
         )
 
     out = gray.copy()
@@ -99,17 +98,22 @@ def _read_bits(image: np.ndarray, n_bits: int, start: int, quant_step: int) -> n
     return bits
 
 
-def extract(image: np.ndarray, quant_step: int = QUANT_STEP) -> str:
+def extract_bytes(image: np.ndarray, quant_step: int = QUANT_STEP) -> bytes:
     total_blocks = _block_count(image)
     if total_blocks < HEADER_BITS:
         raise ValueError("Image too small to contain a length header")
 
-    header = _read_bits(image, HEADER_BITS, 0, quant_step)
-    length = _bits_to_int(header)
-    message_bits_needed = length * 8
+    length = _bits_to_int(_read_bits(image, HEADER_BITS, 0, quant_step))
 
-    if HEADER_BITS + message_bits_needed > total_blocks:
-        raise ValueError("Declared message length exceeds available data")
+    if HEADER_BITS + length * 8 > total_blocks:
+        raise ValueError("Declared payload length exceeds available data")
 
-    message_bits = _read_bits(image, message_bits_needed, HEADER_BITS, quant_step)
-    return _bits_to_bytes(message_bits).decode("utf-8")
+    return _bits_to_bytes(_read_bits(image, length * 8, HEADER_BITS, quant_step))
+
+
+def embed(message: str, image: np.ndarray, quant_step: int = QUANT_STEP) -> np.ndarray:
+    return embed_bytes(message.encode("utf-8"), image, quant_step)
+
+
+def extract(image: np.ndarray, quant_step: int = QUANT_STEP) -> str:
+    return extract_bytes(image, quant_step).decode("utf-8")
