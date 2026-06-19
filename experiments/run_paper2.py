@@ -92,9 +92,7 @@ def _score_samples(samples) -> pd.DataFrame:
                 "rate": s["rate"],
                 "label": s["label"],
                 "chi_score": chi["embedding_probability"],
-                "chi_pred": int(chi["is_stego"]),
                 "hist_score": hist["score"],
-                "hist_pred": int(hist["is_stego"]),
             }
         )
     return pd.DataFrame(rows)
@@ -124,37 +122,70 @@ def _binary_metrics(labels: np.ndarray, preds: np.ndarray) -> dict[str, float]:
     }
 
 
+def _choose_threshold(labels: np.ndarray, scores: np.ndarray) -> float:
+    n_pos = max(int(labels.sum()), 1)
+    n_neg = max(int((1 - labels).sum()), 1)
+    best_threshold, best_j = float(scores.min()), -1.0
+    for threshold in np.unique(scores):
+        preds = scores >= threshold
+        tpr = np.sum(preds & (labels == 1)) / n_pos
+        fpr = np.sum(preds & (labels == 0)) / n_neg
+        j = tpr - fpr
+        if j > best_j:
+            best_j, best_threshold = j, float(threshold)
+    return best_threshold
+
+
 DETECTORS = (
-    ("chi_square", "chi_score", "chi_pred"),
-    ("histogram", "hist_score", "hist_pred"),
+    ("chi_square", "chi_score"),
+    ("histogram", "hist_score"),
 )
 
 
-def _summarize(scores: pd.DataFrame) -> pd.DataFrame:
-    rows = []
+def _evaluate(scores: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    labels = scores["label"].to_numpy()
     covers = scores[scores["label"] == 0]
-    for detector, score_col, pred_col in DETECTORS:
-        labels = scores["label"].to_numpy()
-        _, _, auc = _roc(labels, scores[score_col].to_numpy())
-        cover_fpr = float(np.mean(covers[pred_col] == 1)) if len(covers) else float("nan")
+    operating_rows, rate_rows = [], []
+
+    for detector, score_col in DETECTORS:
+        values = scores[score_col].to_numpy()
+        threshold = _choose_threshold(labels, values)
+        preds = (values >= threshold).astype(int)
+        metrics = _binary_metrics(labels, preds)
+        _, _, pooled_auc = _roc(labels, values)
+        cover_scores = covers[score_col].to_numpy()
+        operating_rows.append(
+            {
+                "detector": detector,
+                "threshold": round(threshold, 4),
+                "accuracy": metrics["accuracy"],
+                "tpr_overall": metrics["tpr"],
+                "fpr": metrics["fpr"],
+                "pooled_auc": pooled_auc,
+                "n_covers": int(len(covers)),
+            }
+        )
+
         for method in ("lsb", "dct"):
             for rate in EMBED_RATES:
                 subset = scores[(scores["method"] == method) & np.isclose(scores["rate"], rate)]
-                tpr = float(np.mean(subset[pred_col] == 1)) if len(subset) else float("nan")
-                mean_score = float(subset[score_col].mean()) if len(subset) else float("nan")
-                rows.append(
+                pos = subset[score_col].to_numpy()
+                tpr = float(np.mean(pos >= threshold)) if len(pos) else float("nan")
+                roc_labels = np.concatenate([np.zeros(len(cover_scores)), np.ones(len(pos))])
+                roc_scores = np.concatenate([cover_scores, pos])
+                _, _, auc = _roc(roc_labels, roc_scores)
+                rate_rows.append(
                     {
                         "detector": detector,
                         "method": method,
                         "embed_rate": rate,
                         "tpr": tpr,
-                        "mean_score": mean_score,
-                        "cover_fpr": cover_fpr,
-                        "auc_all_stego": auc,
-                        "n_covers": int(len(covers)),
+                        "auc": auc,
+                        "mean_score": float(pos.mean()) if len(pos) else float("nan"),
                     }
                 )
-    return pd.DataFrame(rows)
+
+    return pd.DataFrame(operating_rows), pd.DataFrame(rate_rows)
 
 
 def _plot_roc(scores: pd.DataFrame, out_path: Path) -> None:
@@ -203,29 +234,39 @@ def main() -> None:
     covers, real = _load_covers()
     samples = _build_samples(covers, rng)
     scores = _score_samples(samples)
-    summary = _summarize(scores)
+    operating, rate_summary = _evaluate(scores)
 
     scores_csv = RESULTS_DIR / "paper2_detection_scores.csv"
+    operating_csv = RESULTS_DIR / "paper2_operating_points.csv"
     summary_csv = RESULTS_DIR / "paper2_detection_summary.csv"
     roc_png = RESULTS_DIR / "paper2_roc.png"
+    auc_png = RESULTS_DIR / "paper2_auc_vs_rate.png"
     tpr_png = RESULTS_DIR / "paper2_tpr_vs_rate.png"
     score_png = RESULTS_DIR / "paper2_score_vs_rate.png"
     scores.to_csv(scores_csv, index=False)
-    summary.to_csv(summary_csv, index=False)
+    operating.to_csv(operating_csv, index=False)
+    rate_summary.to_csv(summary_csv, index=False)
     _plot_roc(scores, roc_png)
-    _plot_vs_rate(summary, "tpr", "Detection rate (TPR)", "Detection rate vs embedding rate", tpr_png)
-    _plot_vs_rate(summary, "mean_score", "Mean detector score", "Detector response vs embedding rate", score_png)
+    _plot_vs_rate(rate_summary, "auc", "Detection AUC", "Detection AUC vs embedding rate", auc_png)
+    _plot_vs_rate(rate_summary, "tpr", "Detection rate (TPR)", "Detection rate vs embedding rate", tpr_png)
+    _plot_vs_rate(rate_summary, "mean_score", "Mean detector score", "Detector response vs embedding rate", score_png)
 
     n_stego_per_cover = 2 * len(EMBED_RATES)
     print(f"Cover source      : {'real images' if real else 'SYNTHETIC fallback (not paper-valid)'}")
     print(f"Images scored     : {len(scores)} ({len(covers)} covers x (1 + {n_stego_per_cover} stego))")
     print(f"Scores CSV        : {scores_csv.relative_to(ROOT)}")
+    print(f"Operating-pts CSV : {operating_csv.relative_to(ROOT)}")
     print(f"Summary CSV       : {summary_csv.relative_to(ROOT)}")
     print(f"ROC figure        : {roc_png.relative_to(ROOT)}")
+    print(f"AUC-vs-rate figure: {auc_png.relative_to(ROOT)}")
     print(f"TPR-vs-rate figure: {tpr_png.relative_to(ROOT)}")
     print(f"Score-vs-rate fig : {score_png.relative_to(ROOT)}")
     print()
-    print(summary.to_string(index=False))
+    print("Operating points (threshold chosen by Youden's J on pooled cover-vs-stego):")
+    print(operating.to_string(index=False))
+    print()
+    print("Per-rate detection (TPR at the chosen threshold; AUC is threshold-free):")
+    print(rate_summary.to_string(index=False))
 
 
 if __name__ == "__main__":
